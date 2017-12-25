@@ -1,0 +1,1 @@
+Keycloak client for EnMasse. Inspired from EnMasse system tests.
