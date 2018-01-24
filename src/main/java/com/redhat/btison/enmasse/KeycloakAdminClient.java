@@ -1,20 +1,13 @@
 package com.redhat.btison.enmasse;
 
-import java.io.ByteArrayInputStream;
-import java.security.KeyStore;
-import java.security.cert.CertificateFactory;
-import java.util.Arrays;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-
-import javax.ws.rs.core.Response;
-
+import com.redhat.btison.enmasse.kubernetes.ClusterAccess;
+import com.redhat.btison.enmasse.kubernetes.Kubernetes;
 import org.jboss.resteasy.client.jaxrs.ResteasyClientBuilder;
 import org.keycloak.admin.client.Keycloak;
 import org.keycloak.admin.client.KeycloakBuilder;
 import org.keycloak.admin.client.resource.RealmResource;
 import org.keycloak.representations.idm.CredentialRepresentation;
+import org.keycloak.representations.idm.GroupRepresentation;
 import org.keycloak.representations.idm.RealmRepresentation;
 import org.keycloak.representations.idm.UserRepresentation;
 import org.kohsuke.args4j.CmdLineException;
@@ -23,8 +16,15 @@ import org.kohsuke.args4j.Option;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.redhat.btison.enmasse.kubernetes.ClusterAccess;
-import com.redhat.btison.enmasse.kubernetes.Kubernetes;
+import javax.ws.rs.core.Response;
+import java.io.ByteArrayInputStream;
+import java.security.KeyStore;
+import java.security.cert.CertificateFactory;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 public class KeycloakAdminClient {
 
@@ -123,7 +123,7 @@ public class KeycloakAdminClient {
         return operation.replace("-", "").toUpperCase();
     }
 
-    private void createUser(String realm, String userName, String password, long timeout, TimeUnit timeUnit) throws Exception {
+    private void createUser(String realm, String userName, String password, int timeout, TimeUnit timeUnit) throws Exception {
 
         int maxRetries = 10;
         try (CloseableKeycloak keycloak = new CloseableKeycloak(endpoint, credentials, trustStore)) {
@@ -138,7 +138,7 @@ public class KeycloakAdminClient {
                         cred.setType(CredentialRepresentation.PASSWORD);
                         cred.setValue(password);
                         cred.setTemporary(false);
-                        userRep.setCredentials(Arrays.asList(cred));
+                        userRep.setCredentials(Collections.singletonList(cred));
                         userRep.setEnabled(true);
                         Response response = keycloak.get().realm(realm).users().create(userRep);
                         if (response.getStatus() != 201) {
@@ -154,6 +154,96 @@ public class KeycloakAdminClient {
                 }
             }
         }
+
+        String sendGroup = "send_*";
+        String receiveGroup = "recv_*";
+        String manageGroup = "manage";
+        createGroup(realm, sendGroup);
+        createGroup(realm, receiveGroup);
+        createGroup(realm, manageGroup);
+        joinGroup(realm, sendGroup, userName, timeout, timeUnit);
+        joinGroup(realm, receiveGroup, userName, timeout, timeUnit);
+        joinGroup(realm, manageGroup, userName, timeout, timeUnit);
+    }
+
+    private void createGroup(String realm, String groupName) throws Exception {
+        int maxRetries = 10;
+        try (CloseableKeycloak keycloak = new CloseableKeycloak(endpoint, credentials, trustStore)) {
+            if (!groupExist(keycloak, realm, groupName)) {
+                for (int retries = 0; retries < maxRetries; retries++) {
+                    try {
+                        GroupRepresentation groupRep = new GroupRepresentation();
+                        groupRep.setName(groupName);
+                        Response response = keycloak.get().realm(realm).groups().add(groupRep);
+                        if (response.getStatus() != 201) {
+                            throw new RuntimeException("Unable to create group: " + response.getStatus());
+                        }
+                        break;
+                    } catch (Exception e) {
+                        log.info("Exception querying keycloak ({}), retrying", e.getMessage());
+                        Thread.sleep(2000);
+                    }
+                }
+            }
+        }
+    }
+
+    private void joinGroup(String realm, String groupName, String username, int timeout, TimeUnit timeUnit) throws Exception {
+        groupOperation(realm, groupName, username, timeout, timeUnit, (realmResource, clientId, groupId) -> {
+            realmResource.users().get(clientId).joinGroup(groupId);
+            log.info("User '{}' successfully joined group '{}'", username, groupName);
+        });
+    }
+
+    private boolean groupExist(CloseableKeycloak keycloak, String realm, String groupName) {
+        List<GroupRepresentation> groups =
+                keycloak.get().realm(realm).groups()
+                        .groups()
+                        .stream()
+                        .filter(group -> group.getName().equals(groupName))
+                        .collect(Collectors.toList());
+        return !groups.isEmpty();
+    }
+
+    private void groupOperation(String realm, String groupName, String username, int timeout, TimeUnit timeUnit,
+                               GroupMethod<RealmResource, String, String> groupMethod) throws Exception {
+        int maxRetries = 10;
+        try (CloseableKeycloak keycloak = new CloseableKeycloak(endpoint, credentials, trustStore)) {
+            RealmResource realmResource = checkRealmExists(keycloak.get(), realm, timeout, timeUnit);
+            for (int retries = 0; retries < maxRetries; retries++) {
+                try {
+                    groupMethod.apply(
+                            realmResource,
+                            getClientId(keycloak, realm, username),
+                            getGroupId(keycloak, realm, groupName));
+                    break;
+                } catch (Exception e) {
+                    log.info("Exception querying keycloak ({}), retrying", e.getMessage());
+                    Thread.sleep(2000);
+                }
+            }
+        }
+    }
+
+    private String getClientId(CloseableKeycloak keycloak, String realm, String username) {
+        List<UserRepresentation> users = keycloak.get().realm(realm).users().search(username);
+        if (!users.isEmpty()) {
+            return users.get(0).getId();
+        }
+        throw new RuntimeException("Unable to find user: " + username);
+    }
+
+    private String getGroupId(CloseableKeycloak keycloak, String realm, String groupName) {
+        List<GroupRepresentation> groups =
+                keycloak.get().realm(realm).groups()
+                        .groups()
+                        .stream()
+                        .filter(group -> group.getName().equals(groupName))
+                        .collect(Collectors.toList());
+        if (!groups.isEmpty()) {
+            return groups.get(0).getId();
+        }
+        throw new RuntimeException("Unable to find group: " + groupName);
     }
 
     private RealmResource checkRealmExists(String realmName, long timeout, TimeUnit timeUnit) throws Exception {
@@ -211,6 +301,11 @@ public class KeycloakAdminClient {
         }
     }
 
+    @FunctionalInterface
+    interface GroupMethod<T, U, V> {
+        void apply(T t, U u, V v);
+    }
+
     private static class CloseableKeycloak implements AutoCloseable {
 
         private final Keycloak keycloak;
@@ -231,7 +326,7 @@ public class KeycloakAdminClient {
                     .build();
         }
 
-        public Keycloak get() {
+        Keycloak get() {
             return keycloak;
         }
 
